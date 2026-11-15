@@ -15,7 +15,9 @@
 //
 // Exits, read again on every bar while holding:
 //   - take profit: the position is worth 0.8% more than its cost (fees included),
-//   - stop loss: the position is worth 2.0% less than its cost.
+//   - stop loss: the position is worth 2.0% less than its cost, and a stop-loss
+//     exit starts a 15-bar cooldown before the next entry, so a falling market
+//     cannot re-trigger a buy bar after bar.
 // Both are checked against the position's cost basis from the account, so the
 // thresholds already include every fee the fills paid. No exit is ever chased
 // across bars: a sell the market refuses is simply sent again next bar.
@@ -47,6 +49,9 @@ const STAKE_FRACTION = 0.6;
 const TAKE_PROFIT = 1.008;
 /** Stop loss: position value at most this multiple of its cost. */
 const STOP_LOSS = 0.98;
+/** Stop-loss cooldown: after a stop-loss exit, wait this many bars before buying again,
+    so a still-falling market cannot re-trigger an entry bar after bar. */
+const STOP_COOLDOWN_BARS = 15;
 /** Orders may fill at most 1% past the close they were decided on. */
 const MAX_SLIPPAGE_BPS = 100;
 
@@ -54,6 +59,8 @@ const SYMBOL = 'CBBTC';
 
 /** The closes seen so far, oldest first, capped at SLOW_BARS. */
 const closes: number[] = [];
+/** First bar index on which a new entry is allowed again (after a stop-loss). */
+let coolUntil = -1;
 
 /** Highest close among the last `n` bars (the current bar included). */
 function rollingHigh(n: number): number | null {
@@ -65,12 +72,16 @@ function rollingHigh(n: number): number | null {
   return high;
 }
 
-/** Whether a held position exits on this close: take profit or stop loss. */
+/** Whether a held position exits on this close: take profit or stop loss. A stop-loss
+    exit also starts the re-entry cooldown, counted in bars from this batch. */
 function exits(state: BarsState, held: { qty: bigint; cost: bigint }): boolean {
   const value = state.value(SYMBOL, held.qty);
   // Compare in integers: value * 1000 >= cost * 1008, and value * 100 <= cost * 98.
   if (value * 1000n >= held.cost * 1008n) return true;
-  if (value * 100n <= held.cost * 98n) return true;
+  if (value * 100n <= held.cost * 98n) {
+    coolUntil = state.seq + STOP_COOLDOWN_BARS;
+    return true;
+  }
   return false;
 }
 
@@ -99,8 +110,9 @@ await runBars({
     const slowHigh = rollingHigh(SLOW_BARS);
     const c = Number(close);
     const dipped =
-      (fastHigh !== null && c <= fastHigh * (1 - FAST_DROP)) ||
-      (slowHigh !== null && c <= slowHigh * (1 - SLOW_DROP));
+      state.seq >= coolUntil &&
+      ((fastHigh !== null && c <= fastHigh * (1 - FAST_DROP)) ||
+        (slowHigh !== null && c <= slowHigh * (1 - SLOW_DROP)));
     if (!dipped) return [];
 
     // Stake 60% of cash, capped by the weight room (100% of equity here).
